@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>K-means — simulação passo a passo</title>
+<style>
+  :root{
+    --blue:#0072B9; --dark:#005CA1; --navy:#013A63; --light:#E3EEF7;
+    --gray:#5B6770; --green:#2E9E5B; --gold:#E8A317; --red:#D24B4B;
+  }
+  *{ box-sizing:border-box; }
+  body{
+    font-family:Arial,'Helvetica Neue',Helvetica,sans-serif;
+    margin:0; background:#ffffff; color:var(--navy);
+  }
+  .wrap{ max-width:1040px; margin:0 auto; padding:18px 22px 28px; }
+  h1{ font-size:26px; margin:4px 0 2px; color:var(--navy); }
+  .hint{ font-size:14px; color:var(--gray); margin:0 0 12px; line-height:1.45; }
+  .hint b{ color:var(--dark); }
+  .stage{ position:relative; }
+  canvas{
+    width:100%; height:auto; display:block;
+    border:1px solid #e2e7ec; border-radius:10px; background:#fafbfc;
+    cursor:crosshair; touch-action:none;
+  }
+  .badge{
+    position:absolute; top:12px; left:12px; background:rgba(255,255,255,.92);
+    border:1px solid #e2e7ec; border-radius:8px; padding:8px 12px; font-size:13px;
+    color:var(--navy); line-height:1.5;
+  }
+  .badge .k{ font-weight:bold; color:var(--dark); }
+  .badge .conv{ color:var(--green); font-weight:bold; }
+  .controls{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:14px 0 6px; }
+  button{
+    font-family:inherit; font-size:14px; font-weight:bold; color:#fff;
+    background:var(--blue); border:none; border-radius:8px; padding:10px 16px;
+    cursor:pointer; transition:filter .12s;
+  }
+  button:hover{ filter:brightness(1.07); }
+  button.sec{ background:#fff; color:var(--dark); border:1.5px solid var(--blue); }
+  button.warn{ background:#fff; color:var(--gray); border:1.5px solid #c9d2da; }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  .legend{ font-size:12.5px; color:var(--gray); margin-top:10px; }
+  .next{ font-weight:bold; color:var(--dark); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="stage">
+    <canvas id="cv" width="960" height="560"></canvas>
+    <div class="badge" id="badge"></div>
+  </div>
+
+  <div class="controls">
+    <button id="assign">Atribuir pontos</button>
+    <button id="move">Mover centróides</button>
+    <button class="sec" id="iter">Iteração completa</button>
+    <button class="sec" id="auto">Executar até convergir</button>
+    <button class="warn" id="resetc">Reiniciar centróides</button>
+    <button class="warn" id="newpts">Novos pontos</button>
+  </div>
+  <div class="legend">
+    Próximo passo sugerido: <span class="next" id="next">posicione os centróides clicando na área.</span>
+  </div>
+</div>
+
+<script>
+(function(){
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const COLORS = ['#0072B9','#2E9E5B','#E8A317','#D24B4B','#7B4FA3','#1FA8A8','#E0529C','#8B6F47'];
+
+  let points = [];
+  let centroids = [];      // {x,y, px,py (posição anterior)}
+  let iteration = 0;
+  let phase = 'place';     // place | assigned | moved
+  let converged = false;
+  let dragIdx = -1;
+  let autoTimer = null;
+
+  // ---- PRNG determinístico ----
+  function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+  function gaussian(rng,m,sd){let u=0,v=0;while(u===0)u=rng();while(v===0)v=rng();return m+sd*Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+
+  function genPoints(seed){
+    const rng = mulberry32(seed);
+    points = [];
+    const blobs = [
+      {cx:235, cy:175, n:42, sd:46},
+      {cx:690, cy:155, n:42, sd:52},
+      {cx:300, cy:425, n:42, sd:48},
+      {cx:715, cy:430, n:42, sd:44},
+    ];
+    for(const b of blobs){
+      for(let i=0;i<b.n;i++){
+        let x=gaussian(rng,b.cx,b.sd), y=gaussian(rng,b.cy,b.sd);
+        x=Math.max(16,Math.min(W-16,x)); y=Math.max(16,Math.min(H-16,y));
+        points.push({x,y,c:-1});
+      }
+    }
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    // pontos
+    for(const p of points){
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,4.5,0,2*Math.PI);
+      ctx.fillStyle = p.c<0 ? '#9aa6b0' : COLORS[p.c%COLORS.length];
+      ctx.globalAlpha = p.c<0 ? 0.75 : 0.88; ctx.fill(); ctx.globalAlpha = 1;
+    }
+    // centróides
+    for(let i=0;i<centroids.length;i++){
+      const c=centroids[i], col=COLORS[i%COLORS.length];
+      // rastro do movimento
+      if(c.px!==undefined && (c.px!==c.x||c.py!==c.y)){
+        ctx.beginPath(); ctx.moveTo(c.px,c.py); ctx.lineTo(c.x,c.y);
+        ctx.strokeStyle=col; ctx.globalAlpha=.35; ctx.lineWidth=2; ctx.stroke(); ctx.globalAlpha=1;
+        ctx.beginPath(); ctx.arc(c.px,c.py,6,0,2*Math.PI);
+        ctx.fillStyle=col; ctx.globalAlpha=.25; ctx.fill(); ctx.globalAlpha=1;
+      }
+      // marcador do centróide (losango)
+      ctx.save();
+      ctx.translate(c.x,c.y); ctx.rotate(Math.PI/4);
+      ctx.fillStyle=col; ctx.strokeStyle='#fff'; ctx.lineWidth=3;
+      ctx.fillRect(-10,-10,20,20); ctx.strokeRect(-10,-10,20,20);
+      ctx.lineWidth=2; ctx.strokeStyle='#013A63'; ctx.strokeRect(-10,-10,20,20);
+      ctx.restore();
+    }
+    drawBadge();
+  }
+
+  function drawBadge(){
+    const b=document.getElementById('badge');
+    let s = '<span class="k">K = '+centroids.length+'</span> &nbsp;·&nbsp; iteração '+iteration;
+    if(converged) s += '<br><span class="conv">✓ Convergiu</span>';
+    b.innerHTML = s;
+  }
+
+  function setNext(t){ document.getElementById('next').textContent = t; }
+
+  function assign(){
+    if(centroids.length===0){ setNext('coloque ao menos um centróide (clique na área).'); return false; }
+    let changed=0;
+    for(const p of points){
+      let best=-1,bd=Infinity;
+      for(let i=0;i<centroids.length;i++){
+        const dx=p.x-centroids[i].x, dy=p.y-centroids[i].y, d=dx*dx+dy*dy;
+        if(d<bd){bd=d;best=i;}
+      }
+      if(p.c!==best){changed++; p.c=best;}
+    }
+    // limpa rastros após atribuição
+    for(const c of centroids){ c.px=undefined; c.py=undefined; }
+    phase='assigned';
+    if(iteration>0 && changed===0){ converged=true; setNext('nenhum ponto mudou de grupo → convergiu.'); }
+    else { converged=false; setNext('mova os centróides para a média de cada grupo.'); }
+    draw();
+    return true;
+  }
+
+  function move(){
+    if(centroids.length===0) return false;
+    if(!points.some(p=>p.c>=0)){ assign(); }
+    let maxMove=0;
+    for(let i=0;i<centroids.length;i++){
+      let sx=0,sy=0,n=0;
+      for(const p of points) if(p.c===i){sx+=p.x;sy+=p.y;n++;}
+      centroids[i].px=centroids[i].x; centroids[i].py=centroids[i].y;
+      if(n>0){
+        const nx=sx/n, ny=sy/n;
+        maxMove=Math.max(maxMove, Math.hypot(nx-centroids[i].x, ny-centroids[i].y));
+        centroids[i].x=nx; centroids[i].y=ny;
+      }
+    }
+    iteration++;
+    phase='moved';
+    setNext('atribua os pontos novamente aos centróides (agora deslocados).');
+    draw();
+    return maxMove;
+  }
+
+  function iterFull(){ assign(); setTimeout(move, 420); }
+
+  function runAuto(){
+    if(autoTimer){ clearInterval(autoTimer); autoTimer=null; return; }
+    if(centroids.length===0){ setNext('coloque ao menos um centróide antes de executar.'); return; }
+    let toggle = (phase==='moved'||phase==='place'); // true => assign next
+    autoTimer = setInterval(()=>{
+      if(toggle){ assign(); }
+      else { move(); }
+      toggle = !toggle;
+      if(converged && !toggle){ clearInterval(autoTimer); autoTimer=null; }
+    }, 650);
+  }
+
+  function resetCentroids(){
+    if(autoTimer){clearInterval(autoTimer);autoTimer=null;}
+    centroids=[]; iteration=0; converged=false; phase='place';
+    for(const p of points) p.c=-1;
+    setNext('posicione os centróides clicando na área.');
+    draw();
+  }
+  function newPoints(){
+    if(autoTimer){clearInterval(autoTimer);autoTimer=null;}
+    genPoints((Math.random()*1e9)|0);
+    centroids=[]; iteration=0; converged=false; phase='place';
+    setNext('posicione os centróides clicando na área.');
+    draw();
+  }
+
+  // ---- interação no canvas ----
+  function canvasXY(e){
+    const r=cv.getBoundingClientRect();
+    const cx = (e.touches? e.touches[0].clientX : e.clientX);
+    const cy = (e.touches? e.touches[0].clientY : e.clientY);
+    return { x:(cx-r.left)*(W/r.width), y:(cy-r.top)*(H/r.height) };
+  }
+  function onDown(e){
+    e.preventDefault();
+    const {x,y}=canvasXY(e);
+    for(let i=0;i<centroids.length;i++){
+      if(Math.hypot(x-centroids[i].x,y-centroids[i].y)<16){ dragIdx=i; return; }
+    }
+    if(centroids.length<COLORS.length){
+      centroids.push({x,y});
+      converged=false; setNext('atribua os pontos aos centróides.');
+      draw();
+    }
+  }
+  function onMove(e){
+    if(dragIdx<0) return;
+    e.preventDefault();
+    const {x,y}=canvasXY(e);
+    centroids[dragIdx].x=x; centroids[dragIdx].y=y;
+    centroids[dragIdx].px=undefined; centroids[dragIdx].py=undefined;
+    draw();
+  }
+  function onUp(){ dragIdx=-1; }
+
+  cv.addEventListener('mousedown',onDown);
+  cv.addEventListener('mousemove',onMove);
+  window.addEventListener('mouseup',onUp);
+  cv.addEventListener('touchstart',onDown,{passive:false});
+  cv.addEventListener('touchmove',onMove,{passive:false});
+  window.addEventListener('touchend',onUp);
+
+  document.getElementById('assign').onclick=assign;
+  document.getElementById('move').onclick=move;
+  document.getElementById('iter').onclick=iterFull;
+  document.getElementById('auto').onclick=runAuto;
+  document.getElementById('resetc').onclick=resetCentroids;
+  document.getElementById('newpts').onclick=newPoints;
+
+  // ---- início ----
+  genPoints(20260627);
+  draw();
+})();
+</script>
+</body>
+</html>
